@@ -60,16 +60,16 @@ def gcn(n_nodes, n_features, adj_matrix):
     out = GraphConv(1, activation='sigmoid')(x, adj_tf)
     return keras.Model(inputs=inp, outputs=out)
 
-def load_adj_matrix(path, n_nodes):
+def load_adj_matrix(path):
     """grid topology from csv (undirected edges)"""
-    adj = np.zeros((n_nodes, n_nodes), dtype=np.float32)
+    adj = np.zeros((N_NODES, N_NODES))
     for _, row in pd.read_csv(path).iterrows():
         i, j = int(row['source']), int(row['target'])
-        if i < n_nodes and j < n_nodes:
-            adj[i, j] = adj[j, i] = 1.0
+        if i < N_NODES and j < N_NODES:
+            adj[i, j] = adj[j, i] = 1
     return adj
 
-def load_all_days(dirs, att_nodes, att_window, parse_day):
+def load_all_days(dirs, parse_day):
     if isinstance(dirs, str):  # single & list of dirs
         dirs = [dirs]
 
@@ -77,7 +77,7 @@ def load_all_days(dirs, att_nodes, att_window, parse_day):
     for dir in dirs:
         files = sorted(os.listdir(dir))
         for fname in tqdm(files, desc=f'Loading {os.path.basename(dir)}'):
-            X, y = parse_day(os.path.join(dir, fname), att_nodes, att_window)
+            X, y = parse_day(os.path.join(dir, fname))
             X_list.append(X)
             y_list.append(y)
             d.append(f"{os.path.basename(dir)}/day{fname.split('day')[1].split('_')[0].split('.')[0]}")
