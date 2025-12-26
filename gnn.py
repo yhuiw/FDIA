@@ -1,5 +1,6 @@
 import os
-import datetime
+import re
+import datetime as dt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -8,6 +9,7 @@ from tensorflow.keras import layers
 from tqdm import tqdm
 import pickle
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix
 from multiprocessing import Pool, cpu_count
@@ -15,19 +17,17 @@ from functools import partial
 
 DATA_TRAIN = ['./v1', './v2', './v3']
 DATA_TEST = ['./v4', './v5']
-
+DEMON = 0   # portion of testset used for training
+CUT = 1.0
 N_NODES = 187
-START, END = 30, 79
-DATA_FRAC = 1.0
-IS_REDUCED = DATA_FRAC < 0.3
-ALARM_THRESHOLD = 0.5
-USE_ALL_FEATURE = False
-PERSISTENCE = 4 # alert iff consecutive steps to reduce false alarm
+ALARM_THRESHOLD = 0.9
+PERSISTENCE = 1
+START, END = PERSISTENCE, 79
 
 
+# SEMI-SUPERVISED CLASSIFICATION WITH GRAPH CONVOLUTIONAL NETWORK; h' = σ(D^(-1/2) A D^(-1/2) h W + b)
 class GraphConv(layers.Layer):
-    # h' = σ(D^(-1/2) A D^(-1/2) h W + b); SEMI-SUPERVISED CLASSIFICATION WITH GRAPH CONVOLUTIONAL NETWORK
-    def __init__(self, units, act='relu', reg=1e-4, **kwargs):
+    def __init__(self, units, act='relu', reg=1e-5, **kwargs):
         super().__init__(**kwargs)
         self.units = units
         self.act = keras.activations.get(act)
@@ -42,176 +42,135 @@ class GraphConv(layers.Layer):
         return self.act(tf.matmul(adj, tf.matmul(inp, self.w)) + self.b)
 
 def gcn(n_nodes, n_feat, adj, reduced=False):
-    # sym norm adj
-    adj = adj + np.eye(adj.shape[0])
+    adj = adj + 5 * np.eye(adj.shape[0])    # trust own sensors more than neighbours'
     d = np.power(np.sum(adj, axis=1), -0.5)
     d[np.isinf(d)] = 0.0
     a_norm = tf.constant(np.diag(d) @ adj @ np.diag(d), dtype=tf.float32)
 
     inp = layers.Input(shape=(n_nodes, n_feat))
-    if reduced:
-        x = GraphConv(32)(inp, a_norm)
-        x = layers.BatchNormalization()(x)
-        x = layers.Dropout(0.5)(x)
-        x = GraphConv(16)(x, a_norm)
-        x = layers.BatchNormalization()(x)
-        x = layers.Dropout(0.4)(x)
-        x = layers.Add()([x, layers.Dense(16)(inp)])
-        x = layers.Activation('relu')(x)
-    else:
-        # increased capacity for weak nodes
-        x = GraphConv(256)(inp, a_norm)
-        x = layers.BatchNormalization()(x)
-        x = layers.Dropout(0.3)(x)
-        x = GraphConv(128)(x, a_norm)
-        x = layers.BatchNormalization()(x)
-        x = layers.Dropout(0.2)(x)
-        x = layers.Add()([x, layers.Dense(128, kernel_regularizer=keras.regularizers.l2(1e-4))(inp)])
-        x = layers.Activation('relu')(x)
-        x = layers.Dropout(0.2)(x)
+    if reduced: # simpler architecture for limited dataset
+        x1 = GraphConv(32)(inp, a_norm)
+        x1 = layers.BatchNormalization()(x1)
+        x1 = layers.Dropout(0.5)(x1)
+        x1 = GraphConv(16)(x1, a_norm)
 
-    out = GraphConv(1, act='sigmoid')(x, a_norm)
+        x2 = layers.Dense(16, activation='relu')(inp)
+        x2 = layers.BatchNormalization()(x2)
+        x2 = layers.Dropout(0.4)(x2)
+    else:
+        # branch 1: neighbors
+        x1 = GraphConv(128)(inp, a_norm)
+        x1 = layers.BatchNormalization()(x1)
+        x1 = layers.Dropout(0.3)(x1)
+        x1 = GraphConv(64)(x1, a_norm)
+        x1 = layers.BatchNormalization()(x1)
+        x1 = layers.Dropout(0.2)(x1)
+
+        # branch 2: self
+        x2 = layers.Dense(64, activation='relu', kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
+        x2 = layers.BatchNormalization()(x2)
+        x2 = layers.Dropout(0.3)(x2)
+
+    out = layers.Dense(1, activation='sigmoid')(layers.Concatenate()([x1, x2]))
     return keras.Model(inputs=inp, outputs=out)
 
 
-class WeightedBCE(keras.losses.Loss): # handling imbalance
+class WeightedBCE(keras.losses.Loss):
     def __init__(self, pos_weight=10.0, **kwargs):
         super().__init__(**kwargs)
         self.pos_weight = pos_weight
 
-    def call(self, y_true, y_pred):
-        y_true = tf.reshape(y_true, [-1])
-        y_pred = tf.clip_by_value(tf.reshape(y_pred, [-1]), 1e-7, 1 - 1e-7)
-        return tf.reduce_mean(-y_true * tf.math.log(y_pred) * self.pos_weight - (1 - y_true) * tf.math.log(1 - y_pred))
-
-
-class BinaryFocalLoss(keras.losses.Loss):   # address node 104 / 128 weak confidence
-    def __init__(self, gamma=3.0, alpha=0.90, **kwargs): # adjust alpha to trade off FN and FP
-        super().__init__(**kwargs)
-        self.gamma = gamma
-        self.alpha = alpha
-
-    def call(self, y_true, y_pred):
-        y_true = tf.reshape(y_true, [-1])
-        y_pred = tf.reshape(y_pred, [-1])
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
-        bce = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
-        pt = y_true * y_pred + (1 - y_true) * (1 - y_pred)
-        alpha_factor = y_true * self.alpha + (1 - y_true) * (1 - self.alpha)
-        focal_weight = alpha_factor * tf.math.pow(1. - pt, self.gamma)
-        return tf.reduce_mean(focal_weight * bce)
+    def call(self, true, pred):
+        true = tf.reshape(true, [-1])
+        pred = tf.clip_by_value(tf.reshape(pred, [-1]), 1e-7, 1 - 1e-7)
+        return tf.reduce_mean(-true * tf.math.log(pred) * self.pos_weight - (1 - true) * tf.math.log(1 - pred))
 
 
 def load_adj(path):
     """grid topology from csv (undirected edges)"""
     adj = np.zeros((N_NODES, N_NODES))
-    for _, r in pd.read_csv(path).iterrows():
-        i, j = int(r['source']), int(r['target'])
-        if i < N_NODES and j < N_NODES:
-            adj[i, j] = adj[j, i] = 1
+    df = pd.read_csv(path)
+    adj[df['source'], df['target']] = adj[df['target'], df['source']] = 1
     return adj
 
 
-def cumul_feat(dv_hist, dt_hist, vs_hist, ts_hist, cent, dfp_hist=None, dfq_hist=None, fps_hist=None, fqs_hist=None):
-    T = dv_hist.shape[1]
+def accumulate(dv, dt, vs, ts, dfp_hist, dfq_hist, cent, adj):
+    T = dv.shape[1]
+    t_range = np.arange(1, T + 1)   # for vectorized feature map
 
-    # cumulative sum for mean calculation
-    dv_cumsum = np.cumsum(dv_hist, axis=1)
-    dt_cumsum = np.cumsum(dt_hist, axis=1)
+    dv_mean = np.cumsum(dv, axis=1) / t_range
+    dt_mean = np.cumsum(dt, axis=1) / t_range
 
-    # cumulative mean: cumsum / t
-    t_range = np.arange(1, T + 1)
-    dv_mean = dv_cumsum / t_range
-    dt_mean = dt_cumsum / t_range
+    dv_std = np.sqrt(np.maximum((np.cumsum(dv ** 2, axis=1) / t_range) - (dv_mean ** 2), 0))
+    dt_std = np.sqrt(np.maximum((np.cumsum(dt ** 2, axis=1) / t_range) - (dt_mean ** 2), 0))
 
-    # cumulative std: use running variance formula
-    dv_sq_cumsum = np.cumsum(dv_hist ** 2, axis=1)
-    dt_sq_cumsum = np.cumsum(dt_hist ** 2, axis=1)
-    dv_var = (dv_sq_cumsum / t_range) - (dv_mean ** 2)
-    dt_var = (dt_sq_cumsum / t_range) - (dt_mean ** 2)
-    dv_std = np.sqrt(np.maximum(dv_var, 0))
-    dt_std = np.sqrt(np.maximum(dt_var, 0))
+    dv_max = np.maximum.accumulate(np.abs(dv), axis=1)
+    dt_max = np.maximum.accumulate(np.abs(dt), axis=1)
 
-    # cumulative max/min
-    dv_abs = np.abs(dv_hist)
-    dt_abs = np.abs(dt_hist)
-    dv_max = np.maximum.accumulate(dv_abs, axis=1)
-    dt_max = np.maximum.accumulate(dt_abs, axis=1)
-    dv_min = np.minimum.accumulate(dv_abs, axis=1)
-    dt_min = np.minimum.accumulate(dt_abs, axis=1)
+    deg = adj.sum(axis=1, keepdims=True) + 1e-8
+    neighbors_dv_avg = (adj @ dv) / deg
+    neighbors_dt_avg = (adj @ dt) / deg
 
-    feats = [   # get last timestep values (current cumulative)
-        # instantaneous deviation
-        dv_hist[:, -1:], dt_hist[:, -1:],
-        # cumulative stats so far
-        dv_mean[:, -1:], dv_std[:, -1:], dv_max[:, -1:], dv_min[:, -1:],
-        dt_mean[:, -1:], dt_std[:, -1:], dt_max[:, -1:], dt_min[:, -1:],
+    dv_diff_neighbors = dv - neighbors_dv_avg
+    dt_diff_neighbors = dt - neighbors_dt_avg
 
-        # energy-based features (more robust than percentiles), suggested by GenAI
-        (dv_hist**2).sum(axis=1, keepdims=True) / T,  # normalized energy
-        (dt_hist**2).sum(axis=1, keepdims=True) / T,
+    #neighbors_dfp_avg = (adj @ dfp_hist) / deg
+    #neighbors_dfq_avg = (adj @ dfq_hist) / deg
 
-        # baseline operational stats
-        np.mean(vs_hist, axis=1, keepdims=True),
-        np.std(vs_hist, axis=1, keepdims=True),
-        np.mean(ts_hist, axis=1, keepdims=True),
-        np.std(ts_hist, axis=1, keepdims=True),
+    if T > 10:
+        # current means/stds (last column of the cumulative arrays)
+        mu_y = neighbors_dv_avg.cumsum(axis=1) / t_range
+        cov = np.cumsum(dv * neighbors_dv_avg, axis=1) / t_range - (dv_mean * mu_y)
 
-        # distribution shape
-        np.percentile(dv_hist, 90, axis=1, keepdims=True),
-        np.percentile(dv_hist, 10, axis=1, keepdims=True),
-        np.percentile(dt_hist, 90, axis=1, keepdims=True),
-        np.percentile(dt_hist, 10, axis=1, keepdims=True),
+        # recalculate neighbor std dev cumulatively
+        denom = dv_std * np.sqrt(np.maximum((np.cumsum(neighbors_dv_avg ** 2, axis=1) / t_range) - (mu_y ** 2), 0))
+        dv_corr = np.divide(cov, denom, out=np.zeros_like(cov), where=denom > 1e-8)
 
-        # temporal patterns: rate of change
-        np.gradient(dv_hist, axis=1)[:, -1:] if T > 1 else np.zeros((dv_hist.shape[0], 1)),
-        np.gradient(dt_hist, axis=1)[:, -1:] if T > 1 else np.zeros((dt_hist.shape[0], 1)),
+        # repeat for voltage angle
+        mu_y_t = neighbors_dt_avg.cumsum(axis=1) / t_range
+        cov_t = np.cumsum(dt * neighbors_dt_avg, axis=1) / t_range - (dt_mean * mu_y_t)
+        denom_t = dt_std * np.sqrt(np.maximum((np.cumsum(neighbors_dt_avg ** 2, axis=1) / t_range) - (mu_y_t ** 2), 0))
+        dt_corr = np.divide(cov_t, denom_t, out=np.zeros_like(cov_t), where=denom_t > 1e-8)
 
-        # outlier persistence
-        (dv_abs > np.std(dv_hist, axis=1, keepdims=True) * 2).sum(axis=1, keepdims=True).astype(float) / T,
-        (dt_abs > np.std(dt_hist, axis=1, keepdims=True) * 2).sum(axis=1, keepdims=True).astype(float) / T,
+        # take the last column to match feature shape
+        dv_corr = dv_corr[:, -1:]
+        dt_corr = dt_corr[:, -1:]
+    else:
+        dv_corr = np.zeros((dv.shape[0], 1))
+        dt_corr = np.zeros((dt.shape[0], 1))
 
+    feats = [
+        dv[:, -1:], dt[:, -1:],
+        dv_mean[:, -1:], dv_std[:, -1:], dv_max[:, -1:],
+        dt_mean[:, -1:], dt_std[:, -1:], dt_max[:, -1:],
+        #(dv**2).sum(axis=1, keepdims=True) / T,
+        #(dt**2).sum(axis=1, keepdims=True) / T,
+        np.mean(vs, axis=1, keepdims=True),
+        np.std(vs, axis=1, keepdims=True),
+        np.mean(ts, axis=1, keepdims=True),
+        np.std(ts, axis=1, keepdims=True),
+        np.percentile(dv, 90, axis=1, keepdims=True),
+        np.percentile(dv, 10, axis=1, keepdims=True),
+        np.percentile(dt, 90, axis=1, keepdims=True),
+        np.percentile(dt, 10, axis=1, keepdims=True),
+        #np.gradient(dv, axis=1)[:, -1:] if T > 1 else np.zeros((dv.shape[0], 1)),
+        #np.gradient(dt, axis=1)[:, -1:] if T > 1 else np.zeros((dt.shape[0], 1)),
+        neighbors_dv_avg[:, -1:], neighbors_dt_avg[:, -1:],
+        dv_diff_neighbors[:, -1:], dt_diff_neighbors[:, -1:],
+        #np.abs(dv_diff_neighbors).mean(axis=1, keepdims=True),
+        #np.abs(dt_diff_neighbors).mean(axis=1, keepdims=True),
+        dv_corr, dt_corr,
+        #dfp_hist[:, -1:], dfq_hist[:, -1:],
+        #neighbors_dfp_avg[:, -1:], neighbors_dfq_avg[:, -1:],
         cent
     ]
-
-    if USE_ALL_FEATURE and dfp_hist is not None:
-        dfp_cumsum = np.cumsum(dfp_hist, axis=1)
-        dfq_cumsum = np.cumsum(dfq_hist, axis=1)
-        dfp_mean = dfp_cumsum / t_range
-        dfq_mean = dfq_cumsum / t_range
-
-        dfp_sq_cumsum = np.cumsum(dfp_hist ** 2, axis=1)
-        dfq_sq_cumsum = np.cumsum(dfq_hist ** 2, axis=1)
-        dfp_var = (dfp_sq_cumsum / t_range) - (dfp_mean ** 2)
-        dfq_var = (dfq_sq_cumsum / t_range) - (dfq_mean ** 2)
-        dfp_std = np.sqrt(np.maximum(dfp_var, 0))
-        dfq_std = np.sqrt(np.maximum(dfq_var, 0))
-
-        dfp_abs = np.abs(dfp_hist)
-        dfq_abs = np.abs(dfq_hist)
-        dfp_max = np.maximum.accumulate(dfp_abs, axis=1)
-        dfq_max = np.maximum.accumulate(dfq_abs, axis=1)
-
-        feats.extend([
-            dfp_hist[:, -1:], dfq_hist[:, -1:],
-            dfp_mean[:, -1:], dfp_max[:, -1:], dfp_std[:, -1:],
-            dfq_mean[:, -1:], dfq_max[:, -1:], dfq_std[:, -1:],
-            np.mean(fps_hist, axis=1, keepdims=True),
-            np.std(fps_hist, axis=1, keepdims=True),
-            np.mean(fqs_hist, axis=1, keepdims=True),
-            np.std(fqs_hist, axis=1, keepdims=True),
-        ])
-
     return np.concatenate(feats, axis=1)
 
 
-def process_pkl(path, cent, start_t, end_t):
+def process_pkl(path, cent, adj, start_t, end_t):
     with open(path, 'rb') as f:
         data = pickle.load(f)
 
-    att_nodes = [n-1 for n in data['esset_btm']['A']]
-    # att_window = data['timeset_a']['A']
-    # att_steps = [f"x{i}" for i in range(min(att_window), max(att_window) + 1)]
     att_steps = [f"x{i}" for i in range(1, END + 1)]
     if len(att_steps) < end_t:
         return None
@@ -224,105 +183,120 @@ def process_pkl(path, cent, start_t, end_t):
     dv = va - vs
     dt = ta - ts
 
-    if USE_ALL_FEATURE:
-        def safe_load(d, s, n):
-            if s not in d:
-                return np.zeros(n)
-            arr = np.asarray(d[s])
-            return arr[:n] if len(arr) >= n else np.pad(arr, (0, n - len(arr)))
+    def safe_load(d, s, n): # load power data
+        if s not in d:
+            return np.zeros(n)
+        arr = np.asarray(d[s])
+        return arr[:n] if len(arr) >= n else np.pad(arr, (0, n - len(arr)))
 
-        fps = np.array([safe_load(data['sch_fp'], s, N_NODES) for s in att_steps[:END]]).T
-        fqs = np.array([safe_load(data['sch_fq'], s, N_NODES) for s in att_steps[:END]]).T
-        fpa = np.array([safe_load(data['attack_fp'], s, N_NODES) for s in att_steps[:END]]).T
-        fqa = np.array([safe_load(data['attack_fq'], s, N_NODES) for s in att_steps[:END]]).T
+    fps = np.array([safe_load(data['sch_fp'], s, N_NODES) for s in att_steps[:END]]).T
+    fqs = np.array([safe_load(data['sch_fq'], s, N_NODES) for s in att_steps[:END]]).T
+    fpa = np.array([safe_load(data['attack_fp'], s, N_NODES) for s in att_steps[:END]]).T
+    fqa = np.array([safe_load(data['attack_fq'], s, N_NODES) for s in att_steps[:END]]).T
 
-        dfp = fpa - fps
-        dfq = fqa - fqs
-    else:
-        dfp = dfq = fps = fqs = None
+    dfp = fpa - fps
+    dfq = fqa - fqs
 
     y_day = np.zeros(N_NODES, dtype=np.float32)
-    for n in att_nodes:
-        y_day[n] = 1.0
+    y_day[np.array(data['esset_btm']['A']) - 1] = 1.0
 
     x_list = []
     for t in range(start_t, end_t):
         sl = slice(None, t + 1)
-        dv_t  = dv[:, sl]
-        dt_t  = dt[:, sl]
-        vs_t  = vs[:, sl]
-        ts_t  = ts[:, sl]
+        x_list.append(accumulate(dv[:, sl], dt[:, sl], vs[:, sl], ts[:, sl], dfp[:, sl], dfq[:, sl], cent, adj))
 
-        if USE_ALL_FEATURE:
-            feats = cumul_feat(
-                dv_t, dt_t, vs_t, ts_t, cent,
-                dfp_hist=dfp[:, sl], dfq_hist=dfq[:, sl],
-                fps_hist=fps[:, sl], fqs_hist=fqs[:, sl]
-            )
-        else:
-            feats = cumul_feat(dv_t, dt_t, vs_t, ts_t, cent)
-
-        x_list.append(feats)
-
-    return np.array(x_list), np.tile(y_day, (len(x_list), 1))
+    dir = os.path.basename(os.path.dirname(path))
+    pkl = re.sub(r'data_|_v\d+|\.pkl', '', os.path.basename(path))
+    return np.array(x_list), np.tile(y_day, (len(x_list), 1)), f"{dir}/{pkl}"
 
 
-def temporal_loader(dirs, adj, start, end, frac=1.0):
+def holdoff(pred, thresh, window):
+    """mark timestep as attacked if prob > thresh for last 'window' consecutive steps"""
+    result = np.zeros_like(pred, dtype=int)
+    for t in range(window - 1, pred.shape[0]):  # start from 3rd timestep
+        result[t, :] = (pred[t - window + 1 : t + 1, :] > thresh).all(axis=0).astype(int)
+    return result
+
+
+def smooth_operator(pred, window=1):
+    smoothed = np.zeros_like(pred)
+    for t in range(pred.shape[0]):
+        start = max(0, t - window + 1)
+        smoothed[t] = pred[start : t + 1].mean(axis=0)  # avg over time for each node
+    return smoothed
+
+
+def temporal_loader(dirs, adj, start, end, frac=1.0, files=None):
     if isinstance(dirs, str):
         dirs = [dirs]
 
+    if files is None:
+        all_files = []
+        for d in dirs:
+            f = sorted([os.path.join(d, x) for x in os.listdir(d)])
+            if frac < 1.0:
+                np.random.shuffle(f)
+                f = f[:int(frac * len(f))]
+            all_files.extend(f)
+    else:
+        all_files = files
+
     cent = np.sum(adj, axis=1, keepdims=True)
     cent = cent / (cent.max() + 1e-8)
-
-    all_files = []
-    for d in dirs:
-        files = sorted([os.path.join(d, f) for f in os.listdir(d) if f.endswith('.pkl')])
-        if frac < 1.0:
-            np.random.shuffle(files)
-            files = files[:int(frac * len(files))]
-        all_files.extend(files)
-
-    x_all, y_all = [], []
-    with Pool(cpu_count()) as pool:
-        results = list(tqdm(
-            pool.imap(partial(process_pkl, cent=cent, start_t=start, end_t=end), all_files),
-            total=len(all_files)))
+    x_all, y_all, meta_all = [], [], []
+    with Pool(min(cpu_count(), 8)) as pool:
+        results = list(tqdm(pool.imap(partial(process_pkl, cent=cent, adj=adj, start_t=start, end_t=end), all_files),
+                            total=len(all_files)))
 
     for result in results:
         if result is not None:
-            X, y = result
+            X, y, meta = result
             x_all.append(X)
             y_all.append(y)
+            meta_all.extend([meta] * len(X))    # repeat meta for each timestep
 
-    return np.concatenate(x_all, axis=0), np.concatenate(y_all, axis=0)
+    return np.concatenate(x_all, axis=0), np.concatenate(y_all, axis=0), meta_all
+
 
 if __name__ == "__main__":
-    # adj = np.zeros((N_NODES, N_NODES), dtype=np.float32)
     adj = load_adj('topology.csv')
     print(f"grid bus: {N_NODES}, edges: {int(adj.sum()) // 2}")
-    print(f"using full features: {USE_ALL_FEATURE}\n")
+    if DEMON > 0:
+        tous = [f for d in DATA_TEST for f in sorted([os.path.join(d, x) for x in os.listdir(d)])]
+        np.random.seed(7)
+        np.random.shuffle(tous)
+        n_split = int(len(tous) * DEMON)
 
-    print("loading training sets...")
-    X_train, y_train = temporal_loader(DATA_TRAIN, adj, START, END, frac=DATA_FRAC)
-    print("loading testing sets...")
-    X_test, y_test = temporal_loader(DATA_TEST, adj, START, END, frac=DATA_FRAC)
-    print(f"train: {X_train.shape}, test: {X_test.shape}")
-    print(f"features per node: {X_train.shape[2]}")
+        print("loading training sets...")
+        X_tr1, y_tr1, _ = temporal_loader(DATA_TRAIN, adj, START, END, CUT)
+        X_tr2, y_tr2, _ = temporal_loader(None, adj, START, END, files=tous[:n_split])
+        X_train = np.concatenate([X_tr1, X_tr2], axis=0)
+        y_train = np.concatenate([y_tr1, y_tr2], axis=0)
 
-    # normalize
+        print("loading testing sets...")
+        X_test, y_test, meta = temporal_loader(None, adj, START, END, files=tous[n_split:])
+
+    else:
+        print("loading training sets...")
+        X_train, y_train, _ = temporal_loader(DATA_TRAIN, adj, START, END, frac=CUT)
+        print("loading testing sets...")
+        X_test, y_test, meta = temporal_loader(DATA_TEST, adj, START, END, frac=CUT)
+    print(f"train {X_train.shape}, test {X_test.shape}")
+
     X_mean = X_train.mean((0, 1), keepdims=True)
     X_std = X_train.std((0, 1), keepdims=True) + 1e-8
     X_train = (X_train - X_mean) / X_std
     X_test = (X_test - X_mean) / X_std
 
-    weight = (y_train.size - y_train.sum()) / (y_train.sum() + 1e-8) * 0.5
+    weight = (y_train.size - y_train.sum()) / (y_train.sum() + 1e-8) * 0.4  # balance prec & rec
     print(f"positive class weight: {weight:.2f}")
     print(f"attack ratio: train {y_train.mean():.4f}, test {y_test.mean():.4f}\n")
 
-    model = gcn(N_NODES, X_train.shape[2], adj, reduced=IS_REDUCED)
-    lr_sch = keras.optimizers.schedules.CosineDecay(    # cosine annealing for better convergence
+    model = gcn(N_NODES, X_train.shape[2], adj, reduced=CUT < 0.3)
+    EP, BS = 50, 32
+    lr_sch = keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=2e-3,
-        decay_steps=50 * (len(X_train) // 32),
+        decay_steps=EP * (len(X_train) // BS),
         alpha=1e-3
     )
     model.compile(
@@ -336,17 +310,14 @@ if __name__ == "__main__":
         ]
     )
 
-    h = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=50, batch_size=32, verbose=1,
-                  callbacks=[   # early stopping upon perfect AUC
-                  keras.callbacks.EarlyStopping(monitor='val_rec', patience=15, restore_best_weights=True, mode='max'),
-                  #keras.callbacks.ReduceLROnPlateau(monitor='val_auc', factor=0.5, patience=8, min_lr=1e-6, mode='max')
-                  ]
-    )
+    h = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=EP, batch_size=BS, verbose=1,
+                  callbacks=[keras.callbacks.EarlyStopping(monitor='val_rec', patience=10, restore_best_weights=True, mode='max')])
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     metrics = ['loss', 'auc', 'prec', 'rec']
     for i, m in enumerate(metrics):
         ax = axes[i // 2, i % 2]
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.plot(h.history[m], label='train')
         ax.plot(h.history[f'val_{m}'], label='val')
         ax.set_title(m.upper())
@@ -356,18 +327,18 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
 
-    pred_raw = model.predict(X_test, verbose=0)[:, :, 0]
-
     n_steps = END - START
     n_days = len(X_test) // n_steps
-    day_pred = pred_raw.reshape(n_days, n_steps, N_NODES)
-    labels_by_day = y_test.reshape(n_days, n_steps, N_NODES)
-    day_node_labels = labels_by_day.max(axis=1)
-    day_node_preds = ((day_pred > ALARM_THRESHOLD).astype(int).sum(axis=1) >= PERSISTENCE).astype(int)
-    mode = ['normal', 'attacked']
-    print(classification_report(day_node_labels.flatten(), day_node_preds.flatten(), target_names=mode))
+    pred_raw = model.predict(X_test, verbose=0)[:, :, 0]
+    pred_smoothed = smooth_operator(pred_raw, 3)
+    day_pred = pred_smoothed.reshape(n_days, n_steps, N_NODES)
+    timestep_labels = y_test
+    timestep_preds = holdoff(pred_smoothed, ALARM_THRESHOLD, PERSISTENCE)
 
-    cm = confusion_matrix(day_node_labels.flatten(), day_node_preds.flatten())
+    mode = ['normal', 'attacked']
+    print(classification_report(timestep_labels.flatten(), timestep_preds.flatten(), target_names=mode))
+
+    cm = confusion_matrix(timestep_labels.flatten(), timestep_preds.flatten())
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt='d', cbar=False, xticklabels=mode, yticklabels=mode)
     plt.ylabel('actual')
@@ -375,49 +346,42 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
 
-    ## DEBUGGING, per-node analysis ↓
     node_preds = day_pred.max(axis=1).mean(axis=0)
-    node_labels = day_node_labels.max(axis=0)
+    node_labels = y_test.max(axis=0)
 
-    print(f"attacked nodes (avg confidence):")
+    # DEBUGGING
+    print(f"\nattacked nodes (avg conf across timesteps):")
     for idx in np.where(node_labels == 1)[0]:
         print(f"  N{idx + 1}: {node_preds[idx]:.4f}")
-
     print(f"\ntop 10 false alarms:")
     normal = np.where(node_labels == 0)[0]
     for idx in normal[np.argsort(node_preds[normal])[-10:][::-1]]:
-        print(f"N{idx + 1}: {node_preds[idx]:.4f}")
-    ## DEBUGGING ↑
+        print(f"  N{idx + 1}: {node_preds[idx]:.4f}")
 
-    d = 0   # probability traces for arbitrary test day
+    d = 1
     day_data = day_pred[d]
-    tgt = labels_by_day[d]
+    tgt = y_test.reshape(n_days, n_steps, N_NODES)[d]
 
-    times = []
-    for t in range(START, END):
-        times.append((datetime.datetime(2000, 1, 1, 0, 0) + datetime.timedelta(minutes=t * 15)).strftime("%H:%M"))
+    base = dt.datetime(2000, 1, 1, 0, 0)    # arbitrary ref
+    times = [(base + dt.timedelta(minutes=t * 15)).strftime("%H:%M") for t in range(START, END)]
 
     plt.figure(figsize=(14, 7))
     att_indices = np.where(tgt.max(axis=0) == 1)[0]
     if len(att_indices) > 0:
-        colors = plt.cm.tab10(np.linspace(0, 1, len(att_indices)))
+        colors = plt.get_cmap('tab10')(np.linspace(0, 1, len(att_indices)))
         for i, idx in enumerate(att_indices):
             c = colors[i]
-            plt.plot(day_data[:, idx], color=c)
+            plt.plot(day_data[:, idx], color=c, linewidth=2.5)
             plt.text(len(day_data) - 1, day_data[-1, idx], f' N{idx + 1}', color=c, va='center')
-    for i, idx in enumerate(np.where(tgt.max(axis=0) == 0)[0][:5]):
-        plt.plot(day_data[:, idx], label='normal' if i == 0 else "")
 
-    attack_active_steps = np.where(tgt.max(axis=1) == 1)[0]
-    if len(attack_active_steps) > 0:
-        plt.axvspan(attack_active_steps[0], attack_active_steps[-1], color='r', alpha=0.05)
-    plt.axhline(y=ALARM_THRESHOLD, color='k', linestyle='--')
+    plt.axvspan(*(np.flatnonzero(tgt.max(1))[[0, -1]]), color='r', alpha=0.05, label='Attack Window')
+    plt.axhline(y=ALARM_THRESHOLD, color='k', linestyle='--', label=f'Thresh ({ALARM_THRESHOLD})')
 
     ticks = np.arange(0, len(times), 4)
     plt.xticks(ticks, [times[i] for i in ticks], rotation=45)
     plt.ylabel('confidence')
-    plt.title(f'Attack Probability Evolution (Day {d + 1})')
-    plt.legend(bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0.0)
+    plt.title(f'Attack Probability Evolution ({meta[d * n_steps]})')
+    plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
