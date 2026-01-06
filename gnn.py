@@ -18,7 +18,7 @@ DATA_TRAIN = ['./storage/v6', './storage/v7', './storage/v8']
 DATA_TEST = ['./storage/v9', './storage/v10']
 CUT = 1.0
 N_NODES = 187
-ALARM_THRESHOLD = 0.9
+ALARM_THRESHOLD = 0.8
 PERSISTENCE = 1
 START, END = PERSISTENCE, 80
 EPS_ATTACK = 1e-4
@@ -143,7 +143,6 @@ def process_pkl(path, adj, start_t, end_t, augment=False):
     if len(att_steps) < end_t:
         return None
 
-    # vect loading
     vs = np.array([data['sch_v'][s] for s in att_steps[:END]]).T
     ts = np.array([data['sch_θ'][s] for s in att_steps[:END]]).T
     va = np.array([data['attack_v'].get(s, data['sch_v'][s]) for s in att_steps[:END]]).T
@@ -164,9 +163,9 @@ def process_pkl(path, adj, start_t, end_t, augment=False):
     attack_cum = np.maximum.accumulate(attack_mask, axis=1)
 
     # fast seq build
-    x_arr = np.array([accumulate(dv[:, :t+1], dt[:, :t+1], vs[:, :t+1], ts[:, :t+1], adj, esb)
+    x_arr = np.array([accumulate(dv[:, :t + 1], dt[:, :t + 1], vs[:, :t + 1], ts[:, :t + 1], adj, esb)
                       for t in range(start_t, end_t)])
-    y_arr = attack_cum[:, start_t:end_t].T
+    y_arr = attack_cum[:, start_t : end_t].T
 
     # aug via flip for training
     if augment and len(att_idx) > 0 and np.random.rand() < AUG_PROB:
@@ -179,23 +178,12 @@ def process_pkl(path, adj, start_t, end_t, augment=False):
         dt2[flip_idx, :] = 0.0
         ac2[flip_idx, :] = 0.0
 
-        x2 = np.array([accumulate(dv2[:, :t+1], dt2[:, :t+1], vs[:, :t+1], ts[:, :t+1], adj, esb)
+        x2 = np.array([accumulate(dv2[:, :t + 1], dt2[:, :t + 1], vs[:, :t + 1], ts[:, :t + 1], adj, esb)
                        for t in range(start_t, end_t)])
-        y2 = ac2[:, start_t:end_t].T
+        y2 = ac2[:, start_t : end_t].T
         return np.concatenate([x_arr, x2], axis=0), np.concatenate([y_arr, y2], axis=0), f"{os.path.basename(path)}_aug"
 
     return x_arr, y_arr, os.path.basename(path)
-
-
-def bias_baseline(model, X, y):
-    """calc bias from test set's normal samples"""
-    preds = model.predict(X, verbose=0)[:, :, 0]
-    priors = np.zeros(N_NODES)
-    for n in range(N_NODES):
-        mask = (y[:, n] == 0)
-        if mask.any():
-            priors[n] = preds[mask, n].mean()
-    return priors
 
 
 def holdoff(pred, thresh, persist=1):
@@ -293,13 +281,12 @@ if __name__ == "__main__":
     n_days = len(X_test) // n_steps
     raw = model.predict(X_test, verbose=0)[:, :, 0]
 
-    # calibrate
-    priors = bias_baseline(model, X_test, y_test)
+    ## calibrate
+    priors = np.percentile(raw, 25, axis=0)
     print(f"bias (N131): {priors[130]:.3f}")
     print(f"bias (N130): {priors[129]:.3f}")
     calib = np.maximum(0, raw - 1.0 * priors)
 
-    ## smooth
     smooth = smooth_operator(raw)
     day_pred = smooth.reshape(n_days, n_steps, N_NODES)
     preds = holdoff(smooth, ALARM_THRESHOLD, PERSISTENCE)
@@ -325,8 +312,11 @@ if __name__ == "__main__":
         print(f" N{i + 1}: {node_p[i]:.4f}")
 
     d = 1
-    data, tgt = day_pred[d], y_test.reshape(n_days, n_steps, N_NODES)[d]
-    times = [(dt.datetime(2000, 1, 1) + dt.timedelta(minutes=t * 15)).strftime("%H:%M") for t in range(START, END)]
+    data = day_pred[d]
+    tgt = y_test.reshape(n_days, n_steps, N_NODES)[d]
+
+    base = dt.datetime(2000, 1, 1)  # arbitrary ref
+    times = [(base + dt.timedelta(minutes=t * 15)).strftime("%H:%M") for t in range(START, END)]
 
     plt.figure(figsize=(14, 7))
     att_idx = np.where(tgt.max(0) == 1)[0]
