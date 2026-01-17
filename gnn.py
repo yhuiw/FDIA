@@ -1,5 +1,4 @@
-import os
-import re
+import os, re
 import datetime as dt
 import numpy as np
 import pandas as pd
@@ -14,16 +13,17 @@ from sklearn.metrics import classification_report, confusion_matrix
 from multiprocessing import Pool, cpu_count
 from functools import partial
 
-DATA_TRAIN = ['./storage/v6', './storage/v7', './storage/v8']
-DATA_TEST = ['./storage/v9', './storage/v10']
+DATA_TRAIN = ['./storage/v1', './storage/v2', './storage/v3']
+DATA_TEST = ['./storage/v4', './storage/v5']
 CUT = 1.0
 N_NODES = 187
-ALARM_THRESHOLD = 0.8
+ALARM_THRESHOLD = 0.6
 PERSISTENCE = 1
 START, END = PERSISTENCE, 80
 EPS_ATTACK = 1e-4
-AUG_PROB = 0.5
+AUG_PROB = 0.6
 AUG_MAX_FLIP = 3
+STORAGE_NODES = [86, 103, 106, 111, 112, 113, 114, 124, 126, 127, 129, 130]
 
 
 # SEMI-SUPERVISED CLASSIFICATION WITH GRAPH CONVOLUTIONAL NETWORK; h' = σ(D^(-1/2) A D^(-1/2) h W + b)
@@ -150,10 +150,13 @@ def process_pkl(path, adj, start_t, end_t, augment=False):
     dv, dt = va - vs, ta - ts
 
     esb = np.zeros((N_NODES, 1), dtype=np.float32)
-    esb[np.array(data['esset_btm']['A']) - 1] = 1.0
+    esb[STORAGE_NODES] = 1.0
 
     y_day = np.zeros(N_NODES, dtype=np.float32)
-    y_day[np.array(data['esset_btm_a']['A']) - 1] = 1.0
+    if 'esset_btm_a' in data:   # v6-10
+        y_day[np.array(data['esset_btm_a']['A']) - 1] = 1.0
+    else:                       # v1-5
+        y_day[np.array(data['esset_btm']['A']) - 1] = 1.0
 
     att_idx = np.where(y_day == 1)[0]
     attack_mask = np.zeros((N_NODES, END), dtype=np.float32)
@@ -245,7 +248,7 @@ if __name__ == "__main__":
     X_val = (X_val - xm) / xs
     X_test = (X_test - xm) / xs
 
-    w = (y_train.size - y_train.sum()) / (y_train.sum() + 1e-8) * 0.1   # adjust factor to balance prec & rec
+    w = (y_train.size - y_train.sum()) / (y_train.sum() + 1e-8) * 0.01   # adjust factor to balance prec & rec
     print(f"pos weight: {w:.2f}")   # accounting augmented data
 
     model = gcn(N_NODES, X_train.shape[2], adj, reduced=CUT < 0.3)
@@ -282,10 +285,10 @@ if __name__ == "__main__":
     raw = model.predict(X_test, verbose=0)[:, :, 0]
 
     ## calibrate
-    priors = np.percentile(raw, 25, axis=0)
-    print(f"bias (N131): {priors[130]:.3f}")
-    print(f"bias (N130): {priors[129]:.3f}")
-    calib = np.maximum(0, raw - 1.0 * priors)
+    #priors = np.percentile(raw, 25, axis=0)
+    #print(f"bias (N131): {priors[130]:.3f}")
+    #print(f"bias (N130): {priors[129]:.3f}")
+    #calib = np.maximum(0, raw - 1.0 * priors)
 
     smooth = smooth_operator(raw)
     day_pred = smooth.reshape(n_days, n_steps, N_NODES)
