@@ -1,4 +1,4 @@
-import os, pickle, yaml, time, warnings, re
+import os, pickle, yaml, time, warnings
 import numpy as np
 import pandas as pd
 from sklearn.metrics import classification_report, confusion_matrix
@@ -9,21 +9,17 @@ import seaborn as sns
 
 warnings.filterwarnings('ignore')
 
-DATA_TRAIN = ['./storage/v1', './storage/v2', './storage/v3']
-DATA_TEST = ['./storage/v4', './storage/v5']
+DATA_TRAIN = ['./storage/v6', './storage/v7', './storage/v8']
+DATA_TEST = ['./storage/v9', './storage/v10']
 N_NODES = 187
 STORAGE_NODES = [87, 104, 107, 112, 113, 114, 115, 125, 127, 128, 131]  # one-indexed
 N_EXAMPLES = 8
 SCALE = 1e4
 
-def load_adj(path='topology.csv'):
+def load_adj(path):
     adj = np.zeros((N_NODES, N_NODES))
-    if os.path.exists(path):
-        df = pd.read_csv(path)
-        for _, r in df.iterrows():
-            i, j = int(r['source']), int(r['target'])
-            if i < N_NODES and j < N_NODES:
-                adj[i, j] = adj[j, i] = 1
+    df = pd.read_csv(path)
+    adj[df['source'], df['target']] = adj[df['target'], df['source']] = 1
     return adj
 
 def safe_corr(x, y):
@@ -67,19 +63,18 @@ def extract_features(path, adj):
             dv_nbr_mean = dv_nbr.mean(axis=0)
             dt_nbr_mean = dt_nbr.mean(axis=0)
             dv_nbr_std = dv_nbr.std(axis=0).mean()
-            dt_nbr_std = dt_nbr.std(axis=0).mean()
+            #dt_nbr_std = dt_nbr.std(axis=0).mean()
         else:
             dv_nbr_mean = np.zeros_like(dv_n)
             dt_nbr_mean = np.zeros_like(dt_n)
             dv_nbr_std = 0.0
-            dt_nbr_std = 0.0
+            #dt_nbr_std = 0.0
 
         # temporal patterns
         dv_grad = np.gradient(dv_n)
-        dt_grad = np.gradient(dt_n)
+        #dt_grad = np.gradient(dt_n)
 
-        # afternoon period (x60-x80) where attacks concentrate
-        afternoon_slice = slice(60, 80)
+        afternoon_slice = slice(60, 80) # when attacks concentrate
         dv_afternoon_max = np.abs(dv_n[afternoon_slice]).max() if len(dv_n) > 60 else 0
 
         feat = {
@@ -105,7 +100,7 @@ def extract_features(path, adj):
             'corr_v_nbr': float(safe_corr(dv_n, dv_nbr_mean)),
             'corr_t_nbr': float(safe_corr(dt_n, dt_nbr_mean)),
             'nbr_std_v': float(dv_nbr_std) * SCALE,
-            # label
+
             'label': int(y[n])
         }
         feats.append(feat)
@@ -120,13 +115,9 @@ def load_dataset(dirs, max_files=60):
         if os.path.exists(d):
             files.extend([os.path.join(d, x) for x in sorted(os.listdir(d)) if x.endswith('.pkl')])
 
-    adj = load_adj()
     dfs = []
-    for f in tqdm(files[:max_files], desc=f"loading {','.join([os.path.basename(d) for d in dirs])}"):
-        try:
-            dfs.append(extract_features(f, adj))
-        except Exception as e:
-            pass
+    for f in tqdm(files[:max_files], desc=f"from {','.join([os.path.basename(d) for d in dirs])}"):
+        dfs.append(extract_features(f, load_adj('topology.csv')))
 
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
@@ -162,15 +153,15 @@ class LLMDetector:
 
         examples = []
 
-        # attack examples: cover severity spectrum
+        # attack examples, cover severity spectrum
         if len(attacks) >= 4:
             attacks_sorted = attacks.sort_values('dv_max')
-            examples.append(attacks_sorted.iloc[0])  # weakest attack
-            examples.append(attacks_sorted.iloc[len(attacks) // 3])  # low-medium
-            examples.append(attacks_sorted.iloc[2 * len(attacks) // 3])  # medium-high
-            examples.append(attacks_sorted.iloc[-1])  # strongest attack
+            examples.append(attacks_sorted.iloc[0])                 # weakest attack
+            examples.append(attacks_sorted.iloc[len(attacks) // 3]) # low-medium
+            examples.append(attacks_sorted.iloc[2 * len(attacks) // 3]) # medium-high
+            examples.append(attacks_sorted.iloc[-1])    # strongest attack
 
-        # normal examples: clean vs boundary cases
+        # normal examples, clean vs boundary cases
         if len(normals) >= 4:
             normals_sorted = normals.sort_values('dv_max')
             examples.append(normals_sorted.iloc[0])  # cleanest
@@ -178,7 +169,7 @@ class LLMDetector:
             examples.append(normals_sorted.iloc[len(normals) // 2])  # median
             examples.append(normals_sorted.iloc[-1])  # highest (boundary)
 
-        return pd.DataFrame(examples).sample(frac=1, random_state=42)
+        return pd.DataFrame(examples).sample(frac=1, random_state=7)
 
     def _format_example(self, row, show_label=True):
         label_str = f" → {'ATTACK' if row['label'] else 'NORMAL'}" if show_label else " →"
@@ -236,7 +227,7 @@ class LLMDetector:
         preds, raw_responses = [], []
         errors = []
 
-        for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="llm inference"):
+        for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="inferencing"):
             pred, raw = self._query_with_retry(row)
             preds.append(pred)
             raw_responses.append(raw)
@@ -254,10 +245,11 @@ class LLMDetector:
             print(f"\nerror analysis (first 5/{len(errors)}):")
             for e in errors[:5]:
                 print(f"  true={e['true']}, pred={e['pred']}, dv_max={e['dv_max']:.2f}")
-                print(f"  llm: '{e['response'][:100]}'")
+                print(f"  LLM: '{e['response'][:100]}'")
 
         return np.array(preds)
 
+    ## CODE COPIED FROM GENAI
     def _query_with_retry(self, row, max_retries=3):
         prompt = self._build_prompt(row)
 
@@ -288,7 +280,7 @@ class LLMDetector:
 
                 elif resp.status_code == 429:   # rate limit hit, wait longer
                     wait_time = (attempt + 1) * 5
-                    print(f"\n[429] Rate limited. Sleeping {wait_time}s...")
+                    print(f"\n[429] rate limited. sleeping {wait_time}s...")
                     time.sleep(wait_time)
                     continue
 
@@ -310,10 +302,10 @@ class LLMDetector:
         return 0
 
 if __name__ == "__main__":
-    print("loading training data...")
+    print("loading training data")
     df_train = load_dataset(DATA_TRAIN, max_files=60)
 
-    print("loading test data...")
+    print("loading test data")
     df_test = load_dataset(DATA_TEST, max_files=40)
 
     if len(df_train) == 0 or len(df_test) == 0:
@@ -338,7 +330,7 @@ if __name__ == "__main__":
     y_pred = clf.predict(test_subset)
     y_true = test_subset['label'].values
 
-    # PLOTTING CODES BELOW BY GENAI, reference only
+    ## PLOTTING CODES BELOW BY GENAI, reference only
     print(classification_report(y_true, y_pred, target_names=['normal', 'attack'], digits=3))
 
     # confusion matrix
