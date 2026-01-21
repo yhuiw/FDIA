@@ -1,3 +1,16 @@
-provider: groq
+# model params
+provider: local # change to 'groq' to run through API
 model: llama-3.3-70b-versatile
-api_key: "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"
+api_key: "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"
+path: "/home/yw3740/FDIA/models/qwen32b"
+
+# data params
+train_dirs: ['./str/v6', './str/v7', './str/v8']
+test_dirs: ['./str/v9', './str/v10']
+nodes: 187
+esb: [86, 103, 106, 111, 112, 113, 114, 124, 126, 127, 129, 130]
+eval_timesteps: [20, 40, 60, 79]
+
+# physics params
+eps_attack: 0.0001
+scale: 10000.0
