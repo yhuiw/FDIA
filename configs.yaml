@@ -1,16 +1,13 @@
 # model params
-provider: local # change to 'groq' to run through API
-model: llama-3.3-70b-versatile
-api_key: "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"
-path: "/home/yw3740/FDIA/models/qwen32b"
+provider: local # default platform, or 'local' with path specified below
+model: meta-llama/llama-4-maverick-17b-128e-instruct  # available: https://console.groq.com/docs/rate-limits
+path: "/home/yw3740/FDIA/models/Qwen2.5-32B-Instruct"
 
 # data params
 train_dirs: ['./str/v6', './str/v7', './str/v8']
 test_dirs: ['./str/v9', './str/v10']
-nodes: 187
-esb: [86, 103, 106, 111, 112, 113, 114, 124, 126, 127, 129, 130]
-eval_timesteps: [20, 40, 60, 79]
+n_node: 187
+esb: [86, 103, 106, 111, 112, 113, 114, 124, 126, 127, 129, 130]  # all energy storage nodes
 
 # physics params
-eps_attack: 0.0001
-scale: 10000.0
+eps_attack: 0.0001 # min deviation to be considered active attack
